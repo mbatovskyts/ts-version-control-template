@@ -1,0 +1,163 @@
+# Start a ThoughtSpot Migration run from a request issue.
+#
+# The migration console app (or any collaborator) opens an issue whose title starts with
+# "[migration-request]" and whose body holds:
+#   dry_run: <true|false>
+#   require_rls: <true|false>   (optional)
+# The workflow runs every org in config/orgs/, so there is no org to choose; an "org" line is
+# only accepted when it says "all".
+#
+# This workflow checks that the issue author has write access to this repository, validates
+# the values, then dispatches ts-migration.yml on ts-prod with exactly those inputs. It does not change
+# ts-migration.yml, org-migration.yml or anything they do: the run that starts is the same run
+# as "Actions -> ThoughtSpot Migration -> Run workflow" (promote PR, merge wait, snapshot,
+# import, reports and restore-point tag all unchanged).
+#
+# The result is written back to the issue (a status block appended to the body, plus a comment)
+# and the issue is closed. Issues without the title prefix are skipped at the job level, so they
+# use no runner time. The issue text is only read as data inside the script, never interpolated
+# into a shell command.
+name: Migration Request
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+
+# One request at a time, so each request is matched to the run it started.
+concurrency:
+  group: migration-request
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: Validate and start migration
+    if: startsWith(github.event.issue.title, '[migration-request]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+      issues: write
+    steps:
+      - name: Checkout org configs from ts-prod
+        uses: actions/checkout@v4
+        with:
+          ref: ts-prod
+          sparse-checkout: config/orgs
+          sparse-checkout-cone-mode: false
+
+      - name: Validate request and dispatch ThoughtSpot Migration
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { owner, repo } = context.repo;
+            const issue = context.payload.issue;
+            const issueNumber = issue.number;
+            const requester = issue.user.login;
+            const WORKFLOW = 'ts-migration.yml';
+            const REF = 'ts-prod';
+            const actionsUrl = `https://github.com/${owner}/${repo}/actions/workflows/${WORKFLOW}`;
+
+            async function finish(status, lines) {
+              const block = ['', '---', `status: ${status}`, ...lines].join('\n');
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: issueNumber,
+                body: `**${status === 'started' ? 'Migration started' : 'Migration request rejected'}**\n\n` +
+                      [`status: ${status}`, ...lines].join('\n'),
+              });
+              await github.rest.issues.update({
+                owner, repo, issue_number: issueNumber,
+                body: (issue.body || '') + '\n' + block + '\n',
+                state: 'closed',
+                state_reason: status === 'started' ? 'completed' : 'not_planned',
+              });
+            }
+            async function reject(reason) {
+              core.notice(`Rejected: ${reason}`);
+              await finish('rejected', [`reason: ${reason}`, `requested_by: ${requester}`]);
+            }
+
+            // 1. Only a person with write access may start a migration.
+            if (issue.user.type !== 'User') {
+              await reject('requests must be opened by a person');
+              return;
+            }
+            let permission = 'none';
+            let role = 'none';
+            try {
+              const res = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: requester });
+              permission = res.data.permission || 'none';
+              role = res.data.role_name || permission;
+            } catch (e) {
+              permission = 'none';
+            }
+            if (!['admin', 'write'].includes(permission) && !['admin', 'maintain', 'write'].includes(role)) {
+              await reject(`${requester} does not have write access to this repository`);
+              return;
+            }
+
+            // 2. Parse and validate the two inputs.
+            const text = issue.body || '';
+            const field = (name) => {
+              const m = text.match(new RegExp('^\\s*' + name + '\\s*:\\s*(\\S+)\\s*$', 'mi'));
+              return m ? m[1].trim() : null;
+            };
+            const orgRaw = field('org');
+            const dryRaw = field('dry_run');
+            if (orgRaw && orgRaw.toLowerCase() !== 'all') {
+              await reject('the migration runs every org in config/orgs/ and cannot be limited to one: remove the "org" line (or use "org: all")');
+              return;
+            }
+            const dryRun = (dryRaw || '').toLowerCase();
+            if (!['true', 'false'].includes(dryRun)) {
+              await reject('missing or invalid "dry_run" line (expected: dry_run: true or false)');
+              return;
+            }
+            // Optional line: require_rls: true (stop unless every liveboard and model sits on a
+            // table with an RLS rule). Absent means false.
+            const rlsRaw = (field('require_rls') || 'false').toLowerCase();
+            if (!['true', 'false'].includes(rlsRaw)) {
+              await reject('invalid "require_rls" line (expected: require_rls: true or false)');
+              return;
+            }
+
+            // 3. Dispatch the existing workflow with exactly these inputs.
+            // Whole seconds only: GitHub's `created` filter is not guaranteed to accept milliseconds.
+            const since = new Date(Date.now() - 10000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                owner, repo, workflow_id: WORKFLOW, ref: REF,
+                inputs: { dry_run: dryRun, require_rls: rlsRaw },
+              });
+            } catch (e) {
+              await reject(`could not start ${WORKFLOW}: ${e.message}`);
+              core.setFailed(e.message);
+              return;
+            }
+
+            // 4. Find the run it started (requests are serialized by the concurrency group).
+            let runUrl = '';
+            for (let i = 0; i < 10 && !runUrl; i++) {
+              await new Promise((r) => setTimeout(r, 6000));
+              const res = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: WORKFLOW, event: 'workflow_dispatch',
+                branch: REF, created: `>=${since}`, per_page: 20,
+              });
+              const runs = res.data.workflow_runs
+                .filter((r) => (r.triggering_actor || r.actor || {}).login === 'github-actions[bot]')
+                .sort((a, b) => a.created_at.localeCompare(b.created_at));
+              if (runs.length) runUrl = runs[0].html_url;
+            }
+
+            await finish('started', [
+              'orgs: all configured',
+              `dry_run: ${dryRun}`,
+              `require_rls: ${rlsRaw}`,
+              `requested_by: ${requester}`,
+              `run: ${runUrl || actionsUrl}`,
+            ]);

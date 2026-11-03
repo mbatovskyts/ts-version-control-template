@@ -1,0 +1,73 @@
+# Example org configuration — copy and rename to config/orgs/<org_key>.yml
+# org_key must be lowercase with no spaces (used in paths, job names, concurrency keys).
+
+org_key: sales
+display_name: Sales
+
+# The tag you apply in the source org to queue objects for migration. Any non-empty name works;
+# the convention is "<org_key>_readyformigration".
+migration_tag: sales_readyformigration
+
+# Optional. Tag the nightly backup (backup.yml) looks for in both orgs; every object carrying it is
+# saved to the ts-backup branch each night. Defaults to "Version Control".
+# backup_tag: Version Control
+
+# Source cluster (dev / read-only except for tag removal in Stage 10)
+source:
+  base_url: https://dev-ts.mycompany.com  # No trailing slash
+  org_id: 12                               # Integer org ID
+
+# Target cluster (prod / content destination)
+target:
+  base_url: https://prod-ts.mycompany.com # May equal source.base_url (two orgs on one cluster) if org_id differs
+  org_id: 3                               # Integer org ID
+
+# Same-cluster migration: set source.base_url == target.base_url with different org_ids.
+# The pipeline accepts this; it validates that NOT (same url AND same org_id).
+
+# dependency_mode controls what happens to objects that the tagged items depend on:
+#   include          — always export and import all dependencies (recommended)
+#   skip_if_exists   — skip dependencies already present in the target by obj_id
+#   require_tagged   — exclude (and report) a tagged object whose dependency is not itself tagged
+dependency_mode: include
+
+# Optional: obj_ids that are never pulled in as dependencies, in any mode. Use for objects that
+# exist in every org and must not be migrated, such as ThoughtSpot's built-in "TS: BI Server"
+# worksheet or sample data. A dry run prints every dependency Stage 3 pulls.
+# dependency_exclude:
+#   - TSBIServer-eaab6de7
+
+# validation_gate controls what Stage 9 does with an object that Stage 8's validate-only import
+# rejected:
+#   block  — skip it (and what depends on it); it keeps its tag and the run is reported red (default)
+#   warn   — import it anyway and let the real import decide
+# validation_gate: block
+
+# Variable mappings for database/schema parameterization.
+# source_value is used ONLY to detect Path B literals and for safety-gate checks.
+# target_value is the only value ever written to the target cluster.
+# NEVER hardcode actual DB/schema names in scripts or committed TML.
+variables:
+  database:
+    ts_variable_name: ts_db_name        # Name of the TABLE_MAPPING variable in ThoughtSpot
+    source_value: DEV_DB                # Literal value in source TML (Path B detection)
+    target_value: PROD_DB               # Value to set in target org
+  schema:
+    ts_variable_name: ts_schema_name
+    source_value: DEV_SCHEMA
+    target_value: PROD_SCHEMA
+
+  # Optional extra variables (formula variables used in RLS, etc.)
+  # type: FORMULA_VARIABLE | TABLE_MAPPING | CONNECTION_PROPERTY
+  # For FORMULA_VARIABLE, target_value is set org-wide only if it is not an ABAC variable.
+  # ABAC formula variables (set per-user via token at login) have target_value omitted;
+  # the pipeline creates the definition only and logs that values are assigned at login.
+  extra: []
+  # Example:
+  # extra:
+  #   - ts_variable_name: region_filter
+  #     type: FORMULA_VARIABLE
+  #     data_type: VARCHAR      # FORMULA_VARIABLE only: VARCHAR (default), INT32, INT64, DOUBLE, DATE, DATE_TIME
+  #     target_value: "EMEA"
+  # Variable names are unique across the whole cluster, so a name that already exists in another org
+  # of the same cluster (for example the source org) cannot be created again in the target org.

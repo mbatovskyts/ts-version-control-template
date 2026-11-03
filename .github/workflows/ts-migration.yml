@@ -1,0 +1,93 @@
+# Entry-point workflow: one click migrates every org configured in config/orgs/.
+# Triggered manually via workflow_dispatch from the Actions UI.
+name: ThoughtSpot Migration
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: validate only, no writes to target, no tag removal'
+        required: false
+        default: false
+        type: boolean
+      require_rls:
+        description: 'Require RLS: stop before exporting unless every liveboard and model to migrate sits on a table with an RLS rule'
+        required: false
+        default: false
+        type: boolean
+
+# Caller must grant at least the permissions requested by reusable workflow jobs.
+# extract/report need contents:write (commit TML to ts-dev).
+# promote needs contents:write + pull-requests:write (create branch + PR).
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # ------------------------------------------------------------------ #
+  # setup: read config/orgs/*.yml and build the matrix of org keys      #
+  # ------------------------------------------------------------------ #
+  setup:
+    name: Build org matrix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PyYAML
+        run: pip install pyyaml --quiet
+
+      - name: Build matrix
+        id: build
+        shell: python3 {0}
+        run: |
+          import os, json, glob
+          import yaml
+
+          configs = sorted(glob.glob('config/orgs/*.yml'))
+          if not configs:
+              print('::error::No org config files found in config/orgs/')
+              raise SystemExit(1)
+
+          org_keys = []
+          for path in configs:
+              with open(path) as f:
+                  cfg = yaml.safe_load(f)
+              key = cfg.get('org_key', '')
+              stem = os.path.splitext(os.path.basename(path))[0]
+              if stem != key:
+                  print(f'::notice::Skipping {path}: filename stem "{stem}" != org_key "{key}" (template file?)')
+                  continue
+              org_keys.append(key)
+
+          if not org_keys:
+              print('::error::No org config found in config/orgs/')
+              raise SystemExit(1)
+
+          matrix = json.dumps({'org_key': org_keys})
+          print(f'matrix={matrix}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
+              fh.write(f'matrix={matrix}\n')
+
+  # ------------------------------------------------------------------ #
+  # migrate: one reusable-workflow call per org, no fail-fast           #
+  # ------------------------------------------------------------------ #
+  migrate:
+    name: Migrate org ${{ matrix.org_key }}
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    uses: ./.github/workflows/org-migration.yml
+    with:
+      org_key: ${{ matrix.org_key }}
+      dry_run: ${{ inputs.dry_run }}
+      require_rls: ${{ inputs.require_rls }}
+    secrets: inherit
+    concurrency:
+      group: ts-migration-${{ matrix.org_key }}
+      cancel-in-progress: false

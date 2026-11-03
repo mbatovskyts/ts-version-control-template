@@ -1,0 +1,611 @@
+# Reusable per-org migration workflow.
+# Called once per org by ts-migration.yml with its own concurrency group.
+#
+# Branch layout:
+#   ts-prod  - default branch; holds pipeline scripts + approved TML
+#   ts-dev   - TML-only export branch; scripts are overlaid at runtime from ts-prod
+name: Org Migration (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      org_key:
+        description: 'Org key matching a file in config/orgs/'
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run: validate only, no writes, no tag removal'
+        required: false
+        default: false
+        type: boolean
+      require_rls:
+        description: 'Stage 3 stops unless every liveboard and model to migrate sits on a table with an RLS rule'
+        required: false
+        default: false
+        type: boolean
+    # The ThoughtSpot credentials live in the dev and prod ENVIRONMENTS, which the calling job
+    # (no environment) cannot see, so GitHub must not insist they arrive from the caller. The jobs
+    # that need them run in an environment and read them from there; a missing one fails Stage 2
+    # with a clear message.
+    secrets:
+      TS_SOURCE_USERNAME:
+        required: false
+      TS_SOURCE_SECRET_KEY:
+        required: false
+      TS_TARGET_USERNAME:
+        required: false
+      TS_TARGET_SECRET_KEY:
+        required: false
+      GH_AUTOMATION_TOKEN:
+        required: false
+      # With the GH_APP_CLIENT_ID variable: a GitHub App's key, so the promote PRs are opened by
+      # the app (a different identity from you) and you can approve them. See docs/runbook.md.
+      GH_APP_PRIVATE_KEY:
+        required: false
+
+env:
+  ORG_KEY: ${{ inputs.org_key }}
+  DRY_RUN: ${{ inputs.dry_run }}
+  REQUIRE_RLS: ${{ inputs.require_rls }}
+  PYTHON_VERSION: '3.11'
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================ #
+  # JOB 1: extract  (GitHub Environment: dev)                    #
+  # Stages 1-6: config, auth, discover, export, sanitize, commit #
+  # ============================================================ #
+  extract:
+    name: Extract (${{ inputs.org_key }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: dev
+    permissions:
+      contents: write
+    outputs:
+      run_id: ${{ steps.ids.outputs.run_id }}
+      timestamp: ${{ steps.ids.outputs.timestamp }}
+      manifest_count: ${{ steps.discover.outputs.manifest_count }}
+    env:
+      TS_SOURCE_USERNAME: ${{ secrets.TS_SOURCE_USERNAME }}
+      TS_SOURCE_SECRET_KEY: ${{ secrets.TS_SOURCE_SECRET_KEY }}
+      TS_TARGET_USERNAME: ${{ secrets.TS_TARGET_USERNAME }}
+      TS_TARGET_SECRET_KEY: ${{ secrets.TS_TARGET_SECRET_KEY }}
+      TS_SOURCE_USERNAME__OVERRIDE: ${{ secrets[format('TS_SOURCE_USERNAME_{0}', inputs.org_key)] }}
+      TS_SOURCE_SECRET_KEY__OVERRIDE: ${{ secrets[format('TS_SOURCE_SECRET_KEY_{0}', inputs.org_key)] }}
+      TS_TARGET_USERNAME__OVERRIDE: ${{ secrets[format('TS_TARGET_USERNAME_{0}', inputs.org_key)] }}
+      TS_TARGET_SECRET_KEY__OVERRIDE: ${{ secrets[format('TS_TARGET_SECRET_KEY_{0}', inputs.org_key)] }}
+      # Stage output files land in workspace so artifact upload/download works across jobs
+      CONFIG_OUT: config.json
+      MANIFEST_OUT: manifest.json
+      EXPORT_OUT: stage4_export.json
+      SANITIZE_OUT: sanitize_results.json
+      MEMORY_EXPORT_OUT: stage4b_memory_export.json
+      INSTRUCTIONS_EXPORT_OUT: stage4c_instructions_export.json
+      DISCOVER_OUT: stage3_discover_failures.json
+    steps:
+      - name: Checkout ts-dev (TML storage)
+        uses: actions/checkout@v4
+        with:
+          ref: ts-dev
+          fetch-depth: 0
+          token: ${{ secrets.GH_AUTOMATION_TOKEN || github.token }}
+
+      - name: Overlay pipeline scripts from workflow source
+        # ts-dev stores TML only; scripts live on ts-prod (the workflow source branch).
+        # Unstage after checkout so stage6_commit.py's git pull --rebase sees a clean index.
+        env:
+          SOURCE_REF: ${{ github.ref_name }}
+        run: |
+          git fetch origin "$SOURCE_REF"
+          git checkout "origin/$SOURCE_REF" -- scripts/ config/ requirements.txt
+          git restore --staged scripts/ config/ requirements.txt
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate run IDs
+        id: ids
+        run: |
+          RUN_ID="${{ github.run_id }}-${{ github.run_attempt }}"
+          TIMESTAMP=$(date -u '+%Y%m%dT%H%M%SZ')
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "timestamp=$TIMESTAMP" >> "$GITHUB_OUTPUT"
+          echo "RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
+          echo "TIMESTAMP=$TIMESTAMP" >> "$GITHUB_ENV"
+
+      - name: Stage 1 — Validate config
+        run: python -m scripts.stage1_config
+
+      - name: Stage 2 — Authenticate
+        run: python -m scripts.stage2_auth
+
+      - name: Stage 3 — Discover tagged objects
+        id: discover
+        run: |
+          python -m scripts.stage3_discover
+          COUNT=$(python -c "import json; data=json.load(open('${MANIFEST_OUT}')); print(len(data))")
+          echo "manifest_count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Stage 4 — Export TML
+        run: python -m scripts.stage4_export
+
+      - name: Stage 4b — Export Model Memory (Spotter)
+        run: python -m scripts.stage4b_export_memory
+
+      - name: Stage 4c — Export Model NL Instructions (Spotter)
+        run: python -m scripts.stage4c_export_instructions
+
+      - name: Stage 5 — Verify parameterization and sanitize
+        run: python -m scripts.stage5_sanitize
+
+      - name: Stage 6 — Commit to ts-dev
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          python -m scripts.stage6_commit
+
+      - name: Upload stage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extract-${{ inputs.org_key }}-${{ steps.ids.outputs.run_id }}
+          path: |
+            config.json
+            manifest.json
+            stage4_export.json
+            sanitize_results.json
+            stage4b_memory_export.json
+            stage4c_instructions_export.json
+            stage3_discover_failures.json
+            orgs/${{ inputs.org_key }}/
+          if-no-files-found: warn
+          retention-days: 90
+
+  # ============================================================ #
+  # JOB 2: promote                                               #
+  # Stage 7: open PR from promote/<org>/<run_id> into ts-prod   #
+  # Stage 7b: wait for the PR to be approved and merged          #
+  # ============================================================ #
+  promote:
+    name: Promote (${{ inputs.org_key }})
+    needs: extract
+    runs-on: ubuntu-latest
+    # Covers the review wait (Stage 7b); GitHub-hosted jobs are capped at 360 minutes.
+    timeout-minutes: 345
+    outputs:
+      # The ts-prod commit the promote PR merged as; empty on a dry run or when nothing was promoted.
+      merge_sha: ${{ steps.wait.outputs.merge_sha }}
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      RUN_ID: ${{ needs.extract.outputs.run_id }}
+      TIMESTAMP: ${{ needs.extract.outputs.timestamp }}
+      MANIFEST_OUT: manifest.json
+      MERGE_WAIT_TIMEOUT_MIN: '330'
+    steps:
+      - name: Create GitHub App token (promote PRs opened by the app)
+        # When the repository has the GH_APP_CLIENT_ID variable and GH_APP_PRIVATE_KEY secret,
+        # the promote branch and PR are created by the app, not by a person's token. GitHub does
+        # not let an author approve their own PR, so this is what lets one maintainer approve
+        # the pipeline's PRs. Without it the next steps fall back to GH_AUTOMATION_TOKEN, then
+        # the workflow's own token. The app token lasts about an hour, so it is only used to open
+        # the PR; Stage 7b's long wait uses the job token.
+        id: app
+        if: ${{ vars.GH_APP_CLIENT_ID != '' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.GH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+
+      - name: Checkout ts-prod
+        uses: actions/checkout@v4
+        with:
+          ref: ts-prod
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token || secrets.GH_AUTOMATION_TOKEN || github.token }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download extract artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: extract-${{ inputs.org_key }}-${{ needs.extract.outputs.run_id }}
+
+      - name: Stage 7 — Promote to ts-prod
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GH_AUTOMATION_TOKEN || github.token }}
+          # Off unless the repository variable is 'true'; see scripts/stage7_promote.py.
+          PROMOTE_AUTO_MERGE: ${{ vars.PROMOTE_AUTO_MERGE }}
+        run: python -m scripts.stage7_promote
+
+      - name: Stage 7b — Wait for PR approval and merge
+        id: wait
+        # The import job needs this job, so nothing reaches the target until a reviewer
+        # has approved the promote PR (required by branch protection on ts-prod) and it
+        # has merged. Skipped on dry runs and when Stage 7 opened no PR.
+        # Only reads the PR, for hours: use the job's own token, which outlives an app token.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -m scripts.stage7b_wait_for_merge
+
+      - name: Upload promote artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: promote-${{ inputs.org_key }}-${{ needs.extract.outputs.run_id }}
+          path: |
+            stage7_promote.json
+            stage7b_wait.json
+          if-no-files-found: warn
+          retention-days: 90
+
+  # ============================================================ #
+  # JOB 3: import  (GitHub Environment: prod)                    #
+  # Stages 8-9: prod prep, import                                #
+  # ============================================================ #
+  import:
+    name: Import (${{ inputs.org_key }})
+    needs: [extract, promote]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: prod
+    permissions:
+      contents: read
+    env:
+      RUN_ID: ${{ needs.extract.outputs.run_id }}
+      TIMESTAMP: ${{ needs.extract.outputs.timestamp }}
+      TS_SOURCE_USERNAME: ${{ secrets.TS_SOURCE_USERNAME }}
+      TS_SOURCE_SECRET_KEY: ${{ secrets.TS_SOURCE_SECRET_KEY }}
+      TS_TARGET_USERNAME: ${{ secrets.TS_TARGET_USERNAME }}
+      TS_TARGET_SECRET_KEY: ${{ secrets.TS_TARGET_SECRET_KEY }}
+      TS_SOURCE_USERNAME__OVERRIDE: ${{ secrets[format('TS_SOURCE_USERNAME_{0}', inputs.org_key)] }}
+      TS_SOURCE_SECRET_KEY__OVERRIDE: ${{ secrets[format('TS_SOURCE_SECRET_KEY_{0}', inputs.org_key)] }}
+      TS_TARGET_USERNAME__OVERRIDE: ${{ secrets[format('TS_TARGET_USERNAME_{0}', inputs.org_key)] }}
+      TS_TARGET_SECRET_KEY__OVERRIDE: ${{ secrets[format('TS_TARGET_SECRET_KEY_{0}', inputs.org_key)] }}
+      # Point to the downloaded artifact files (same cwd-relative names as extract job)
+      CONFIG_OUT: config.json
+      MANIFEST_OUT: manifest.json
+      EXPORT_OUT: stage4_export.json
+      SANITIZE_OUT: sanitize_results.json
+      PROD_PREP_OUT: prod_prep.json
+      IMPORT_OUT: stage9_import.json
+      MEMORY_IMPORT_OUT: stage9b_memory_import.json
+      INSTRUCTIONS_IMPORT_OUT: stage9c_instructions_import.json
+    steps:
+      - name: Checkout ts-prod
+        uses: actions/checkout@v4
+        with:
+          ref: ts-prod
+          fetch-depth: 0       # the promote PR's merge commit must be reachable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download extract artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: extract-${{ inputs.org_key }}-${{ needs.extract.outputs.run_id }}
+
+      - name: Download promote artifact
+        # stage7_promote.json lists the files Stage 7 left out because ts-prod already held them.
+        if: ${{ !inputs.dry_run }}
+        uses: actions/download-artifact@v4
+        with:
+          name: promote-${{ inputs.org_key }}-${{ needs.extract.outputs.run_id }}
+
+      - name: Use the approved TML from the merge commit
+        # The artifact also carries the extracted orgs/<org>/ files, which are the copy from
+        # before review. Replace them with what ts-prod holds at the promote PR's merge commit,
+        # so edits (or removals) made by the reviewer are what gets imported. The scripts keep
+        # running from the current ts-prod. On a dry run nothing is merged, so the artifact
+        # stays the source.
+        if: ${{ !inputs.dry_run }}
+        env:
+          MERGE_SHA: ${{ needs.promote.outputs.merge_sha }}
+        run: python -m scripts.restore_merged_tml
+
+      - name: Stage 8 — Prod prep (variables, connections, validate)
+        run: python -m scripts.stage8_prod_prep
+
+      - name: Stage 8b — Snapshot what the target holds now
+        # Saves the target's current version of every object about to be overwritten, as the
+        # "before" copy. Read-only. A failed capture stops the run before anything is imported.
+        if: ${{ !inputs.dry_run }}
+        env:
+          SNAPSHOT_OUT: stage8b_snapshot.json
+        run: python -m scripts.stage8b_snapshot
+
+      - name: Stage 9 — Import to production
+        if: ${{ !inputs.dry_run }}
+        run: python -m scripts.stage9_import
+
+      - name: Stage 9 — Dry-run skip notice
+        if: ${{ inputs.dry_run }}
+        run: echo '::notice::DRY_RUN=true — Stage 9 import skipped, no writes to target'
+
+      - name: Stage 9b — Import Model Memory (Spotter)
+        run: python -m scripts.stage9b_import_memory
+
+      - name: Stage 9c — Import Model NL Instructions (Spotter)
+        run: python -m scripts.stage9c_import_instructions
+
+      - name: Upload snapshot of the target (before the import)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-${{ inputs.org_key }}-${{ needs.extract.outputs.run_id }}
+          path: |
+            snapshot/${{ inputs.org_key }}/
+            stage8b_snapshot.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Upload import artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: import-${{ inputs.org_key }}-${{ needs.extract.outputs.run_id }}
+          path: |
+            prod_prep.json
+            import_source.json
+            stage9_import.json
+            stage9b_memory_import.json
+            stage9c_instructions_import.json
+          if-no-files-found: warn
+          retention-days: 90
+
+  # ============================================================ #
+  # JOB 4: untag_source  (GitHub Environment: dev)               #
+  # Stage 10: post-check + remove migration tag from successes  #
+  # ============================================================ #
+  untag_source:
+    name: Untag source (${{ inputs.org_key }})
+    needs: [extract, import]
+    if: ${{ !inputs.dry_run && needs.import.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: dev
+    permissions:
+      contents: read
+    env:
+      RUN_ID: ${{ needs.extract.outputs.run_id }}
+      TIMESTAMP: ${{ needs.extract.outputs.timestamp }}
+      TS_SOURCE_USERNAME: ${{ secrets.TS_SOURCE_USERNAME }}
+      TS_SOURCE_SECRET_KEY: ${{ secrets.TS_SOURCE_SECRET_KEY }}
+      TS_TARGET_USERNAME: ${{ secrets.TS_TARGET_USERNAME }}
+      TS_TARGET_SECRET_KEY: ${{ secrets.TS_TARGET_SECRET_KEY }}
+      TS_SOURCE_USERNAME__OVERRIDE: ${{ secrets[format('TS_SOURCE_USERNAME_{0}', inputs.org_key)] }}
+      TS_SOURCE_SECRET_KEY__OVERRIDE: ${{ secrets[format('TS_SOURCE_SECRET_KEY_{0}', inputs.org_key)] }}
+      TS_TARGET_USERNAME__OVERRIDE: ${{ secrets[format('TS_TARGET_USERNAME_{0}', inputs.org_key)] }}
+      TS_TARGET_SECRET_KEY__OVERRIDE: ${{ secrets[format('TS_TARGET_SECRET_KEY_{0}', inputs.org_key)] }}
+      CONFIG_OUT: config.json
+      MANIFEST_OUT: manifest.json
+      IMPORT_OUT: stage9_import.json
+      POSTCHECK_OUT: stage10_postcheck.json
+      # Spotter results (written by stages 4b/4c/9b/9c): Stage 10 keeps tags and Stage 11
+      # reports failures based on them.
+      MEMORY_EXPORT_OUT: stage4b_memory_export.json
+      MEMORY_IMPORT_OUT: stage9b_memory_import.json
+      INSTRUCTIONS_EXPORT_OUT: stage4c_instructions_export.json
+      INSTRUCTIONS_IMPORT_OUT: stage9c_instructions_import.json
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download import artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: import-${{ inputs.org_key }}-${{ needs.extract.outputs.run_id }}
+
+      - name: Download extract artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: extract-${{ inputs.org_key }}-${{ needs.extract.outputs.run_id }}
+
+      - name: Stage 10 — Post-check and tag cleanup
+        run: python -m scripts.stage10_postcheck
+
+      - name: Upload postcheck artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postcheck-${{ inputs.org_key }}-${{ needs.extract.outputs.run_id }}
+          path: stage10_postcheck.json
+          if-no-files-found: warn
+          retention-days: 90
+
+  # ============================================================ #
+  # JOB 5: report  (if: always() — runs even on failure)        #
+  # Stage 11: consolidate all stage JSONs and write reports      #
+  # ============================================================ #
+  report:
+    name: Report (${{ inputs.org_key }})
+    needs: [extract, promote, import, untag_source]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      RUN_ID: ${{ needs.extract.outputs.run_id }}
+      TIMESTAMP: ${{ needs.extract.outputs.timestamp }}
+      CONFIG_OUT: config.json
+      MANIFEST_OUT: manifest.json
+      EXPORT_OUT: stage4_export.json
+      SANITIZE_OUT: sanitize_results.json
+      PROD_PREP_OUT: prod_prep.json
+      IMPORT_OUT: stage9_import.json
+      POSTCHECK_OUT: stage10_postcheck.json
+      # Spotter results (written by stages 4b/4c/9b/9c): Stage 10 keeps tags and Stage 11
+      # reports failures based on them.
+      MEMORY_EXPORT_OUT: stage4b_memory_export.json
+      MEMORY_IMPORT_OUT: stage9b_memory_import.json
+      INSTRUCTIONS_EXPORT_OUT: stage4c_instructions_export.json
+      INSTRUCTIONS_IMPORT_OUT: stage9c_instructions_import.json
+      DISCOVER_OUT: stage3_discover_failures.json
+    steps:
+      - name: Checkout ts-dev (TML storage)
+        uses: actions/checkout@v4
+        with:
+          ref: ts-dev
+          fetch-depth: 0
+          token: ${{ secrets.GH_AUTOMATION_TOKEN || github.token }}
+
+      - name: Overlay pipeline scripts from workflow source
+        env:
+          SOURCE_REF: ${{ github.ref_name }}
+        run: |
+          git fetch origin "$SOURCE_REF"
+          git checkout "origin/$SOURCE_REF" -- scripts/ config/ requirements.txt
+          git restore --staged scripts/ config/ requirements.txt
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Exact names, not a glob: '*-sales-<id>' would also match another org's 'extract-emea-sales-<id>'
+      # and overlay its files on this org's report.
+      - name: Download extract artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: extract-${{ inputs.org_key }}-${{ needs.extract.outputs.run_id }}
+        continue-on-error: true
+
+      - name: Download import artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: import-${{ inputs.org_key }}-${{ needs.extract.outputs.run_id }}
+        continue-on-error: true
+
+      - name: Download post-check artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: postcheck-${{ inputs.org_key }}-${{ needs.extract.outputs.run_id }}
+        continue-on-error: true
+
+      - name: Stage 11 — Generate reports
+        run: python -m scripts.stage11_report
+
+      - name: Commit reports to ts-dev
+        # Runs even when Stage 11 exited non-zero: reports for failed runs matter most.
+        # Never fails the job; if the push cannot be completed the reports artifact is the copy.
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Must match the folder Stage 11 writes (it uses the same TIMESTAMP).
+          REPORT_DIR="reports/$ORG_KEY/${TIMESTAMP}_${RUN_ID}"
+          if [ ! -d "$REPORT_DIR" ]; then
+            echo "::warning::No report directory at $REPORT_DIR; nothing to commit."
+            exit 0
+          fi
+          git add "$REPORT_DIR"
+          if git diff --cached --quiet; then
+            echo "No report changes to commit."
+            exit 0
+          fi
+          if ! git commit -m "[skip ci] reports: $ORG_KEY run $RUN_ID"; then
+            echo "::warning::Could not commit reports; use the reports artifact."
+            exit 0
+          fi
+          for attempt in 1 2 3 4 5; do
+            if git push origin ts-dev; then
+              echo "Pushed reports to ts-dev (attempt $attempt)."
+              exit 0
+            fi
+            echo "Push rejected; rebasing onto origin/ts-dev and retrying ($attempt/5)..."
+            sleep $((attempt * 2))
+            git pull --rebase --autostash origin ts-dev || true
+          done
+          echo "::warning::Could not push reports to ts-dev after 5 attempts; use the reports artifact."
+
+      - name: Upload final reports as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-${{ inputs.org_key }}-${{ needs.extract.outputs.run_id }}
+          path: reports/${{ inputs.org_key }}/
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Check for failures (fail the job if any objects failed)
+        # Stage 11 above only writes the reports; this step turns the job red, after the
+        # reports have been committed and uploaded.
+        if: always()
+        run: python -m scripts.stage11_report --check-only
+
+  # ============================================================ #
+  # JOB 6: release_tag                                           #
+  # Tag the ts-prod commit that was imported, as a restore point #
+  # for ts-redeploy.yml. Only after a fully clean live run.      #
+  # ============================================================ #
+  release_tag:
+    name: Tag restore point (${{ inputs.org_key }})
+    needs: [extract, promote, import, report]
+    # report succeeds only when Stage 11's check found no failed object, so a tag never
+    # marks content that did not fully reach the target.
+    if: >-
+      ${{ !inputs.dry_run
+          && needs.import.result == 'success'
+          && needs.report.result == 'success'
+          && needs.promote.outputs.merge_sha != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # A missing tag must not turn a finished migration red; it shows as a failed job instead.
+    continue-on-error: true
+    permissions:
+      contents: write
+    env:
+      ORG_KEY: ${{ inputs.org_key }}
+      RUN_ID: ${{ needs.extract.outputs.run_id }}
+      MERGE_SHA: ${{ needs.promote.outputs.merge_sha }}
+    steps:
+      - name: Checkout ts-prod
+        uses: actions/checkout@v4
+        with:
+          ref: ts-prod
+          fetch-depth: 0
+          token: ${{ secrets.GH_AUTOMATION_TOKEN || github.token }}
+
+      - name: Tag the imported ts-prod commit
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          python3 -m scripts.tag_release

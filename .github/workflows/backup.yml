@@ -1,0 +1,163 @@
+# Nightly backup of every object tagged with the backup tag ("Version Control"), in both the dev
+# (source) and prod (target) org of each configured org. Read-only on ThoughtSpot.
+#
+# Each night's exports are committed to the ts-backup branch (created on the first run); the git
+# history of a file is that object's list of versions. Nothing is ever deleted from the branch.
+#
+# Timing: GitHub starts scheduled workflows hours late (5 to 7 hours in practice), so the schedule
+# cannot hit 9 PM. The 9 PM start is a dispatch from outside (a routine or an outside scheduler
+# calling workflow_dispatch), which always runs. The two scheduled runs below are a safety net:
+# backup_gate lets one through only if it lands in the 9 PM hour US Eastern or no backup has been
+# committed to ts-backup in the last 20 hours.
+#
+# The dev side runs in the `dev` environment and the prod side in the `prod` environment, because
+# that is where the credentials live. If `prod` requires reviewers, the prod side waits for one;
+# see docs/runbook.md ("Nightly backup").
+name: Nightly Backup
+
+on:
+  schedule:
+    - cron: '5 1 * * *'
+    - cron: '5 2 * * *'
+  workflow_dispatch:
+    inputs:
+      org:
+        description: 'Org key to back up (e.g. "sales") or "all"'
+        required: true
+        default: 'all'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ts-backup
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Is it 9 PM?
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/backup_gate.py
+
+  setup:
+    name: Build matrix
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install pyyaml --quiet
+      - id: build
+        env:
+          INPUT_ORG: ${{ inputs.org || 'all' }}
+        run: python3 scripts/backup_matrix.py
+
+  backup:
+    name: Back up ${{ matrix.org_key }} (${{ matrix.env }})
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ matrix.environment }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    env:
+      ORG_KEY: ${{ matrix.org_key }}
+      SIDE: ${{ matrix.side }}
+      BACKUP_OUT: backup_out
+      TS_SOURCE_USERNAME: ${{ secrets.TS_SOURCE_USERNAME }}
+      TS_SOURCE_SECRET_KEY: ${{ secrets.TS_SOURCE_SECRET_KEY }}
+      TS_TARGET_USERNAME: ${{ secrets.TS_TARGET_USERNAME }}
+      TS_TARGET_SECRET_KEY: ${{ secrets.TS_TARGET_SECRET_KEY }}
+      TS_SOURCE_USERNAME__OVERRIDE: ${{ secrets[format('TS_SOURCE_USERNAME_{0}', matrix.org_key)] }}
+      TS_SOURCE_SECRET_KEY__OVERRIDE: ${{ secrets[format('TS_SOURCE_SECRET_KEY_{0}', matrix.org_key)] }}
+      TS_TARGET_USERNAME__OVERRIDE: ${{ secrets[format('TS_TARGET_USERNAME_{0}', matrix.org_key)] }}
+      TS_TARGET_SECRET_KEY__OVERRIDE: ${{ secrets[format('TS_TARGET_SECRET_KEY_{0}', matrix.org_key)] }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Export the tagged objects
+        run: python -m scripts.backup_objects
+      - name: Keep the exports for the commit job
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-${{ matrix.org_key }}-${{ matrix.env }}
+          path: backup_out
+          if-no-files-found: ignore
+          retention-days: 7
+
+  commit:
+    name: Commit to ts-backup
+    needs: [gate, backup]
+    if: always() && needs.gate.outputs.run == 'true' && needs.backup.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tools
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: backup-*
+          path: incoming
+          merge-multiple: true
+
+      - name: Check out the backup branch (created on the first run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          url="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          if git ls-remote --exit-code --heads "$url" ts-backup >/dev/null 2>&1; then
+            git clone --quiet --depth 1 --branch ts-backup "$url" store
+          else
+            mkdir store
+            git -C store init --quiet --initial-branch ts-backup
+            git -C store remote add origin "$url"
+            echo "Creating the ts-backup branch."
+          fi
+          git -C store config user.name "github-actions[bot]"
+          git -C store config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fold the exports into the branch
+        id: fold
+        working-directory: tools
+        env:
+          INCOMING: ${{ github.workspace }}/incoming
+          STORE: ${{ github.workspace }}/store
+        run: python -m scripts.backup_commit
+
+      - name: Commit and push
+        working-directory: store
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing changed tonight; no commit."
+            exit 0
+          fi
+          git commit --quiet -m "backup: $(date -u +%F) (${{ steps.fold.outputs.changed }} object version(s))"
+          for i in 1 2 3 4; do
+            git push origin ts-backup && exit 0
+            sleep $((i * 3)); git pull --quiet --rebase origin ts-backup
+          done
+          exit 1
