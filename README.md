@@ -8,6 +8,8 @@ It also carries over Spotter content that TML does not include: **model memory**
 - **No object is ever deleted** in the target. The one thing that is replaced, not added to, is Spotter model memory and NL instructions: when dev has content for a model, it replaces what the target model has.
 - **Objects are matched by `obj_id`**, so re-running updates the existing target object instead of creating a duplicate.
 
+**Quick start:** make a private copy of this repository, set the default branch to `ts-prod`, add your `dev` and `prod` environments with the four `TS_*` secrets, then run **Actions → Setup → Run workflow**. It creates the branches and your org config and checks your credentials. The full steps are in [`DEPLOYMENT_INSTRUCTIONS.md`](DEPLOYMENT_INSTRUCTIONS.md).
+
 **New here? Follow [`DEPLOYMENT_INSTRUCTIONS.md`](DEPLOYMENT_INSTRUCTIONS.md) to set the tool up in your own repository.** You can run it from the Actions tab or from the optional [run UI](#optional-run-ui). For setup (secrets, environments, branch protection) and troubleshooting, see [`docs/runbook.md`](docs/runbook.md). For API details, see [`docs/api-verification.md`](docs/api-verification.md).
 
 ## How it works
@@ -210,7 +212,9 @@ Every live migration that had something to promote and finishes with no failed o
 ```
 .github/workflows/   ts-migration.yml (entry point), org-migration.yml (per-org pipeline), ts-redeploy.yml (redeploy/rollback),
                      ci.yml (tests), cleanup-promote-branches.yml, deploy-ui.yml (publishes ui/ to Pages),
-                     backup.yml (nightly backup), migration-request.yml (start a run from a request issue)
+                     backup.yml (nightly backup), migration-request.yml (start a run from a request issue),
+                     setup.yml (first-run setup: branches, org config, credential check)
+.github/ISSUE_TEMPLATE/ migration-request.md (the issue that starts a run)
 config/orgs/         one YAML per org
 scripts/             stage*.py and lib/ (ts_client, tml_utils, artifacts, report)
 orgs/<org>/          exported TML, memory/ and instructions/ (written by the pipeline)

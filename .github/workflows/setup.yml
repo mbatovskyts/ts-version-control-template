@@ -1,0 +1,178 @@
+# First-run setup: does the parts of DEPLOYMENT_INSTRUCTIONS.md that a workflow can do, and checks
+# the rest. Run it from Actions -> Setup -> Run workflow. It is safe to run again at any time.
+#
+#   1. branches  creates the `ts-prod` and `ts-dev` branches if they are missing (Steps 1 and 3).
+#                A repository made from a template often has only `main`.
+#   2. config    if you fill in `org_key` and the other answers, writes config/orgs/<org_key>.yml
+#                and commits it to ts-prod (Step 6). Leave `org_key` blank to skip.
+#   3. check     for every configured org: validates the config, checks the four TS_* secrets are
+#                set in the `dev` environment, and logs in to the source and the target org.
+#                It prints what is still left for you to set by hand.
+#
+# What a workflow cannot change, and you do in Settings: the default branch, the Actions
+# permissions, the environments and secrets, and Pages. The summary lists them.
+name: Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      org_key:
+        description: 'Optional. Short lowercase name for this pair of orgs (e.g. sales). Fill in to create config/orgs/<org_key>.yml'
+        required: false
+        default: ''
+        type: string
+      display_name:
+        description: 'Optional. A readable name for the org pair'
+        required: false
+        default: ''
+        type: string
+      migration_tag:
+        description: 'Optional. Tag you will put on objects to migrate (default: <org_key>_readyformigration)'
+        required: false
+        default: ''
+        type: string
+      source_base_url:
+        description: 'Source (dev) cluster URL, e.g. https://dev-ts.example.com'
+        required: false
+        default: ''
+        type: string
+      source_org_id:
+        description: 'Source (dev) numeric org ID'
+        required: false
+        default: ''
+        type: string
+      target_base_url:
+        description: 'Target (prod) cluster URL (the same as the source if both orgs are on one cluster)'
+        required: false
+        default: ''
+        type: string
+      target_org_id:
+        description: 'Target (prod) numeric org ID'
+        required: false
+        default: ''
+        type: string
+      backup_tag:
+        description: 'Optional. Tag the nightly backup looks for (default: Version Control)'
+        required: false
+        default: ''
+        type: string
+      dependency_mode:
+        description: 'What a tagged object brings with it'
+        required: false
+        default: include
+        type: choice
+        options: [include, skip_if_exists, require_tagged]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ts-setup
+  cancel-in-progress: false
+
+jobs:
+  branches:
+    name: Create the ts-prod and ts-dev branches
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Create the branches that are missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          default=$(gh api "repos/$REPO" --jq .default_branch)
+          sha=$(gh api "repos/$REPO/git/ref/heads/$default" --jq .object.sha)
+          for branch in ts-prod ts-dev; do
+            if gh api "repos/$REPO/git/ref/heads/$branch" >/dev/null 2>&1; then
+              echo "$branch already exists."
+            else
+              gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$branch" -f sha="$sha" >/dev/null
+              echo "Created $branch from $default."
+            fi
+          done
+          if [ "$default" != "ts-prod" ]; then
+            echo "::warning::The default branch is '$default'. Set it to ts-prod (Settings -> General -> Default branch): the pipeline expects that name."
+          fi
+
+  config:
+    name: Create the org config
+    needs: branches
+    if: ${{ inputs.org_key != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout ts-prod
+        uses: actions/checkout@v4
+        with:
+          ref: ts-prod
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write config/orgs/<org_key>.yml
+        # The answers are passed as environment variables and never placed in the script text.
+        env:
+          INPUT_ORG_KEY: ${{ inputs.org_key }}
+          INPUT_DISPLAY_NAME: ${{ inputs.display_name }}
+          INPUT_MIGRATION_TAG: ${{ inputs.migration_tag }}
+          INPUT_SOURCE_BASE_URL: ${{ inputs.source_base_url }}
+          INPUT_SOURCE_ORG_ID: ${{ inputs.source_org_id }}
+          INPUT_TARGET_BASE_URL: ${{ inputs.target_base_url }}
+          INPUT_TARGET_ORG_ID: ${{ inputs.target_org_id }}
+          INPUT_BACKUP_TAG: ${{ inputs.backup_tag }}
+          INPUT_DEPENDENCY_MODE: ${{ inputs.dependency_mode }}
+        run: python scripts/setup_org_config.py
+
+      - name: Commit it to ts-prod
+        env:
+          INPUT_ORG_KEY: ${{ inputs.org_key }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add config/orgs
+          git commit -m "Add org config for $INPUT_ORG_KEY (Setup workflow)"
+          git push origin HEAD:ts-prod
+
+  check:
+    name: Check each org is ready
+    needs: [branches, config]
+    if: ${{ !cancelled() && needs.branches.result == 'success' && needs.config.result != 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Reads the credentials from the `dev` environment (GitHub creates it on the first run if it does
+    # not exist yet; the secrets are then reported as missing).
+    environment: dev
+    permissions:
+      contents: read
+    env:
+      TS_SOURCE_USERNAME: ${{ secrets.TS_SOURCE_USERNAME }}
+      TS_SOURCE_SECRET_KEY: ${{ secrets.TS_SOURCE_SECRET_KEY }}
+      TS_TARGET_USERNAME: ${{ secrets.TS_TARGET_USERNAME }}
+      TS_TARGET_SECRET_KEY: ${{ secrets.TS_TARGET_SECRET_KEY }}
+    steps:
+      - name: Checkout ts-prod
+        uses: actions/checkout@v4
+        with:
+          ref: ts-prod
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check config, secrets and logins
+        run: python scripts/setup_check.py
