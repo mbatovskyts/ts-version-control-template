@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.request
 from datetime import datetime, timezone
@@ -44,7 +45,27 @@ def last_backup_age_hours(repo: str, token: str, now: datetime) -> float | None:
     return (now - when).total_seconds() / 3600
 
 
-def decide(event: str, now: datetime, age_hours: float | None) -> tuple[bool, str]:
+def has_org_configs(config_dir: str = "config/orgs") -> bool:
+    """True when at least one org is configured (a file whose name equals its org_key).
+
+    The template example.yml does not count. Uses only the standard library: the gate job installs
+    nothing.
+    """
+    for path in Path(config_dir).glob("*.yml"):
+        if path.stem == "example":
+            continue
+        m = re.search(r"^org_key:\s*['\"]?([A-Za-z0-9_-]+)['\"]?\s*(#.*)?$",
+                      path.read_text(encoding="utf-8"), re.MULTILINE)
+        if m and m.group(1) == path.stem:
+            return True
+    return False
+
+
+def decide(event: str, now: datetime, age_hours: float | None,
+           configured: bool = True) -> tuple[bool, str]:
+    if event == "schedule" and not configured:
+        return False, ("no org is configured yet, so there is nothing to back up "
+                       "(see DEPLOYMENT_INSTRUCTIONS.md, Step 6)")
     if event != "schedule":
         return True, f"started by {event or 'hand'}, so it runs now"
     if should_run(now):
@@ -62,7 +83,7 @@ def main() -> None:
     age = None
     if event == "schedule" and not should_run(now):
         age = last_backup_age_hours(os.environ.get("GITHUB_REPOSITORY", ""), os.environ.get("GITHUB_TOKEN", ""), now)
-    run, why = decide(event, now, age)
+    run, why = decide(event, now, age, has_org_configs())
     print(f"[BACKUP] {'Running' if run else 'Skipping'}: {why}.")
     out = os.environ.get("GITHUB_OUTPUT")
     if out:

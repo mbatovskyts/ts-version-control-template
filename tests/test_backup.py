@@ -263,3 +263,31 @@ def test_stage1_accepts_and_validates_backup_tag(tmp_path):
     bad = tmp_path / "bad.yml"; bad.write_text(base + "backup_tag: '  '\n")
     with pytest.raises(ConfigError):
         load_and_validate_config(str(bad))
+
+
+# ---- a fresh copy has no org: the scheduled backup stays quiet ---------------------------------------
+
+def test_a_scheduled_run_is_skipped_until_an_org_is_configured():
+    run, why = backup_gate.decide("schedule", utc(2026, 11, 3, 2, 5), None, configured=False)
+    assert run is False and "no org is configured" in why
+
+
+def test_a_manual_run_still_goes_ahead_and_fails_clearly_in_the_matrix_step():
+    assert backup_gate.decide("workflow_dispatch", utc(2026, 11, 3, 2, 5), None, configured=False)[0] is True
+
+
+def test_has_org_configs_ignores_the_template_and_mismatched_names(tmp_path):
+    (tmp_path / "example.yml").write_text("org_key: example\n")
+    (tmp_path / "other.yml").write_text("org_key: sales\n")
+    assert backup_gate.has_org_configs(str(tmp_path)) is False
+    (tmp_path / "sales.yml").write_text('org_key: "sales"   # comment\n')
+    assert backup_gate.has_org_configs(str(tmp_path)) is True
+
+
+def test_gate_main_skips_a_scheduled_run_with_no_org(monkeypatch, tmp_path):
+    out = tmp_path / "out"
+    monkeypatch.chdir(tmp_path)                                  # no config/orgs here
+    monkeypatch.setenv("EVENT_NAME", "schedule")
+    monkeypatch.setenv("GITHUB_OUTPUT", str(out))
+    backup_gate.main()
+    assert out.read_text().strip() == "run=false"

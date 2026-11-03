@@ -19,8 +19,30 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  check:
+    name: Is Pages switched on?
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.pages.outputs.enabled }}
+    steps:
+      - id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          build_type=$(gh api "repos/$REPO/pages" --jq .build_type 2>/dev/null || true)
+          if [ "$build_type" = "workflow" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping the UI deploy: Pages is not set to GitHub Actions yet (Settings -> Pages -> Source: GitHub Actions). The UI is optional."
+          fi
+
   deploy:
     name: Deploy to GitHub Pages
+    needs: check
+    if: needs.check.outputs.enabled == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:

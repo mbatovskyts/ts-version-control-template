@@ -4,6 +4,15 @@ A step-by-step guide to setting this tool up from a fresh copy of the repository
 
 For what the tool does and how each stage works, read [`README.md`](README.md). For day-to-day operation and troubleshooting after setup, see [`docs/runbook.md`](docs/runbook.md).
 
+## The short version
+
+1. **Make your own private copy** of this repository (Step 1).
+2. **In GitHub Settings**, do the three things a workflow cannot do for you: set the default branch to `ts-prod`, allow Actions to create pull requests (Step 4), and create the `dev` and `prod` environments with your four `TS_*` secrets (Step 5).
+3. **Run Actions → Setup → Run workflow.** Fill in your org details. It creates the `ts-prod` and `ts-dev` branches if they are missing (Step 3), writes `config/orgs/<org_key>.yml` (Step 6), and then checks the config, the secrets, and a real login to both orgs. Its job summary lists anything still missing. Run it again after each fix; it is safe to repeat.
+4. **Prepare ThoughtSpot** (Step 7), then do a **dry run** (Step 9) and a **live run** (Step 10).
+
+The numbered steps below explain each part, and how to do it by hand.
+
 ## What you need before you start
 
 **On GitHub**
@@ -36,7 +45,7 @@ For what the tool does and how each stage works, read [`README.md`](README.md). 
 2. Make sure the **default branch is named `ts-prod`** (*Settings → General → Default branch*). The branch names `ts-prod` and `ts-dev` are used throughout the pipeline.
 3. Open the **Actions** tab. If GitHub asks you to enable workflows (*"I understand my workflows, go ahead and enable them"*), do so.
 
-> **Expect a few red runs until setup is finished.** Two workflows start on their own as soon as the repository exists: **Nightly Backup** (twice a day) and **Deploy UI** (whenever `ui/` changes). Until you have finished Step 6 (an org config and its credentials) the backup fails, and until you enable Pages (Step 12) the UI deploy fails. This is harmless. Ignore them, or disable the two workflows in the Actions tab and enable them when you reach those steps.
+> **Quiet until you are set up.** Two workflows start on their own as soon as the repository exists: **Nightly Backup** (twice a day) and **Deploy UI** (whenever `ui/` changes). Each skips itself, with a notice and a green run, until it has something to do: the backup until you have an org config (Step 6), and the UI deploy until Pages is set to *GitHub Actions* (Step 12).
 
 ## Step 2. Check the copy is clean
 
@@ -49,7 +58,7 @@ The pipeline writes exports to a branch called `ts-dev` and expects it to exist.
 1. On the repository's main page open **Branches** (or the branch menu) and choose **New branch**.
 2. Name it `ts-dev`, base it on `ts-prod`, and create it.
 
-You do not need to put anything on it. At run time the pipeline lays the current scripts from `ts-prod` over it and only ever commits exports and reports there. (You can also create the branch with `git branch ts-dev ts-prod && git push origin ts-dev`.)
+The quickest way is the **Setup** workflow (*Actions → Setup → Run workflow*), which creates `ts-dev` (and `ts-prod`, if your copy only has `main`) when they are missing. You do not need to put anything on the branch. At run time the pipeline lays the current scripts from `ts-prod` over it and only ever commits exports and reports there. (You can also create the branch with `git branch ts-dev ts-prod && git push origin ts-dev`.)
 
 ## Step 4. Repository settings for GitHub Actions
 
@@ -89,6 +98,8 @@ You should get JSON containing a `token`. A `401` or `403` means the user, the k
 ## Step 6. Create your org configuration
 
 Each pair of orgs you migrate between has one config file.
+
+**Quick way:** run **Actions → Setup → Run workflow** and fill in `org_key`, the two cluster URLs and the two org IDs (the tag, display name and backup tag are optional). It writes and validates the file, commits it to `ts-prod`, and then checks your secrets and logs in to both orgs. It leaves out the sample `variables:` block described below; add one by hand if your tables use database or schema variables. To do it by hand instead:
 
 1. Copy `config/orgs/example.yml` to `config/orgs/<org_key>.yml`. The **file name must equal `org_key`**, in lowercase with no spaces (for example `sales.yml` with `org_key: sales`).
 2. Edit it. The fields you must set:
@@ -187,6 +198,9 @@ If another tool can open GitHub issues but cannot start workflows, **Migration R
 |---|---|
 | The *Extract* job fails when it checks out `ts-dev` (the branch or ref cannot be found) | The `ts-dev` branch does not exist. Do Step 3. |
 | *GitHub Actions is not permitted to create or approve pull requests* when the promote job opens the pull request | Step 4 is not done: set **Read and write permissions** and allow Actions to create pull requests. |
+| The **Setup** run fails at *Create the org config* | The error names the answer to fix (for example a non-numeric org ID, or an `org_key` with capitals). Nothing is written when an answer is wrong, and an existing config is never overwritten: edit that file directly. |
+| The **Setup** check says secrets are *not set in this environment* | Add the four `TS_*` secrets to the `dev` environment (Step 5). GitHub creates an empty `dev` environment the first time Setup runs. |
+| The **Setup** check fails at *login* | The message after `Auth failed` says why: wrong user or key (401/403), trusted authentication not enabled, or the key lands in a different org than `org_id`. Repeat the `curl` check in Step 5. |
 | *Config validation failed* | The file name does not match `org_key`, or a required field is missing. Check Step 6. |
 | *Auth failed* (HTTP 401 or 403) | Wrong user, secret key or org ID, or trusted authentication is not enabled. Repeat the check in Step 5. |
 | *Session is in org X but org Y is configured ... Refusing to continue* | The token landed in a different org than `org_id`. Check the org ID in your config, and that the service account's key can act in that org. |
@@ -211,7 +225,8 @@ More in the runbook's *Troubleshooting* section.
 - [ ] Workflow permissions set to read and write, and Actions may create pull requests
 - [ ] `dev` and `prod` environments created, each with the four `TS_*` secrets
 - [ ] Credentials tested with the `curl` check
-- [ ] `config/orgs/<org_key>.yml` committed
+- [ ] `config/orgs/<org_key>.yml` committed (the **Setup** workflow can write it)
+- [ ] **Setup** workflow check is green for every org (config, secrets, both logins)
 - [ ] Migration tag created in the source org; test object tagged; every object has an `obj_id`; connections exist in the target
 - [ ] Approval approach chosen (Step 8)
 - [ ] Dry run green
